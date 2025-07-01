@@ -1,7 +1,7 @@
 import { timeoutPromise } from '@scrypted/common/src/promise-utils';
-import sdk, { Intercom, MediaObject, MediaStreamUrl, PictureOptions, RequestPictureOptions, ResponseMediaStreamOptions, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, SettingValue } from "@scrypted/sdk";
+import sdk, { Intercom, MediaObject, MediaStreamUrl, PictureOptions, RequestPictureOptions, ResponseMediaStreamOptions, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, SettingValue, UrlMediaStreamOptions as ScryptedUrlMediaStreamOptions } from "@scrypted/sdk"; // Added Intercom, ScryptedDeviceType, UrlMediaStreamOptions as ScryptedUrlMediaStreamOptions
 import url from 'url';
-import { CameraBase, CameraProviderBase, UrlMediaStreamOptions } from "../../ffmpeg-camera/src/common";
+import { CameraBase, CameraProviderBase, UrlMediaStreamOptions } from "../../ffmpeg-camera/src/common"; // This UrlMediaStreamOptions is from ffmpeg-camera
 
 const { deviceManager } = sdk;
 
@@ -123,17 +123,45 @@ export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
             }
         );
 
-        // Two-Way Audio Settings - MINIMAL
-        ret.push(
+        // Two-Way Audio Settings
+        const twoWayAudioSettings: Setting[] = [
             {
                 key: 'enableTwoWayAudio',
                 title: 'Enable Two-Way Audio (Experimental)',
-                description: 'Enable experimental two-way audio. The plugin will attempt to auto-negotiate transport (UDP then TCP) and codec (AAC > PCMU > PCMA) based on camera capabilities advertised via SDP.',
+                description: 'Enables experimental two-way audio. The plugin will attempt to auto-negotiate transport (UDP then TCP) and codec (AAC > PCMU > PCMA) based on camera capabilities advertised via SDP from the selected Intercom SDP Source Stream.',
                 type: 'boolean',
                 value: this.storage.getItem('enableTwoWayAudio') === 'true',
-                subgroup: 'Two-Way Audio',
-            }
-        );
+            },
+        ];
+
+        // Dynamically build choices for intercomSdpSourceStreamId
+        const streamChoices = [{ title: "Default (Use First Configured Stream)", value: "__default__" }];
+        try {
+            // We need to call getVideoStreamOptions() which might be overridden by RtspSmartCamera
+            // Ensure this method is available or call a more base version if RtspCamera itself needs these settings.
+            // For now, assuming this.getVideoStreamOptions() works or RtspSmartCamera overrides getOtherSettings.
+            // A safer way might be to get raw stream URLs if this is called on RtspCamera base.
+            // However, UrlMediaStreamOptions (which getVideoStreamOptions returns) has id and name.
+            const currentStreams: ScryptedUrlMediaStreamOptions[] = await this.getVideoStreamOptions() || [];
+            currentStreams.forEach(stream => {
+                streamChoices.push({ title: stream.name || stream.id, value: stream.id });
+            });
+        } catch (e) {
+            this.console.error("Error fetching streams for Intercom SDP Source setting:", e);
+        }
+
+        twoWayAudioSettings.push({
+            key: 'intercomSdpSourceStreamId',
+            title: 'Intercom SDP Source Stream',
+            description: "Select which configured stream should be used to get the SDP for discovering two-way audio capabilities. 'Default' uses the first configured stream.",
+            type: 'string', // Dropdown is represented as string type with choices
+            choices: streamChoices,
+            value: this.storage.getItem('intercomSdpSourceStreamId') || "__default__",
+        });
+
+        twoWayAudioSettings.forEach(s => s.subgroup = 'Two-Way Audio');
+        ret.push(...twoWayAudioSettings);
+
         return ret;
     }
 
@@ -164,15 +192,17 @@ export interface Destroyable {
     emit(eventName: string | symbol, ...args: any[]): boolean;
 }
 
-export abstract class RtspSmartCamera extends RtspCamera implements Intercom { // Ensure Intercom is implemented
+export abstract class RtspSmartCamera extends RtspCamera implements Intercom {
     lastListen = 0;
     listener: Promise<Destroyable>;
     // Placeholders for intercom state
     intercomClient: any;
     intercomForwarder: any;
+    // intercomClient, intercomForwarder, intercomUdpServer types defined from previous attempts, ensure they are correct.
     intercomClient: RtspClient;
     intercomForwarder: RtpForwarderProcess;
     intercomUdpServer: { server: import("dgram").Socket; port: number; };
+
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
@@ -183,7 +213,7 @@ export abstract class RtspSmartCamera extends RtspCamera implements Intercom { /
     }
 
     async startIntercom(media: MediaObject): Promise<void> {
-        this.console.log('Attempting to start intercom (minimal config)...');
+        this.console.log('Attempting to start intercom (using selected stream for DESCRIBE)...');
         if (this.intercomClient || this.intercomForwarder) {
             this.console.log('Intercom session already active. Stopping previous session.');
             await this.stopIntercom();
@@ -201,31 +231,56 @@ export abstract class RtspSmartCamera extends RtspCamera implements Intercom { /
             throw new Error('Could not process microphone input.');
         }
 
-        const streamOptions = await this.getVideoStreamOptions();
-        if (!streamOptions || streamOptions.length === 0 || !streamOptions[0].url) {
-            this.console.error('No primary RTSP stream URL configured for the camera to use for DESCRIBE.');
-            throw new Error('No primary RTSP stream URL configured for the camera.');
+        // Determine describeUrl based on intercomSdpSourceStreamId setting
+        let describeUrl: string;
+        const allStreamOptions = await this.getVideoStreamOptions();
+        if (!allStreamOptions || allStreamOptions.length === 0) {
+            this.console.error('No RTSP streams configured for this camera.');
+            throw new Error('No RTSP streams configured for this camera.');
         }
-        const describeUrl = this.addRtspCredentials(streamOptions[0].url);
-        this.console.log(`Using primary stream URL for DESCRIBE: ${describeUrl}`);
 
-        this.intercomClient = new RtspClient(describeUrl);
+        const selectedStreamId = this.storage.getItem('intercomSdpSourceStreamId') || "__default__";
+        let streamSourceDescription: string;
+
+        if (selectedStreamId === "__default__") {
+            describeUrl = allStreamOptions[0].url;
+            streamSourceDescription = `default (first configured stream: ${allStreamOptions[0].name || allStreamOptions[0].id})`;
+        } else {
+            const selectedOption = allStreamOptions.find(s => s.id === selectedStreamId);
+            if (selectedOption) {
+                describeUrl = selectedOption.url;
+                streamSourceDescription = `selected stream: ${selectedOption.name || selectedOption.id}`;
+            } else {
+                this.console.warn(`Configured Intercom SDP Source Stream ID '${selectedStreamId}' not found. Falling back to default (first stream).`);
+                describeUrl = allStreamOptions[0].url;
+                streamSourceDescription = `default (first configured stream after invalid selection: ${allStreamOptions[0].name || allStreamOptions[0].id})`;
+            }
+        }
+
+        if (!describeUrl) { // Should be caught by allStreamOptions check, but as a safeguard
+             this.console.error('Could not determine a valid RTSP URL for DESCRIBE.');
+             throw new Error('Could not determine a valid RTSP URL for DESCRIBE.');
+        }
+
+        this.console.log(`Using URL for DESCRIBE (${streamSourceDescription}): ${describeUrl}`);
+        const describeUrlWithCreds = this.addRtspCredentials(describeUrl);
+
+        this.intercomClient = new RtspClient(describeUrlWithCreds);
         this.intercomClient.console = this.console;
 
+        // Declare variables needed throughout the try block
         let sdp: string;
         let selectedTrack: MSection = null;
         let selectedCodecInfo: { name: string, payloadType: number, clockRate: number, ffmpegEncodingName: string, channels: number } = null;
-        let setupUrl: string;
-        // For storing results from successful SETUP
+        let setupControlUrl: string;
         let currentSessionId: string;
-        let serverRtpPortUdp: number; // Only for UDP
+        let serverRtpPortUdp: number;
         let ssrcUnsigned: number;
         let chosenTransport: 'udp' | 'tcp';
         let confirmedTransportDict: ReturnType<typeof parseSemicolonDelimited>;
 
-
         try {
-            this.console.log(`Sending DESCRIBE request to ${describeUrl}`);
+            this.console.log(`Sending DESCRIBE request to ${describeUrlWithCreds}`);
             const describeResponse = await this.intercomClient.describe();
             if (!describeResponse.body) throw new Error('DESCRIBE response contained no SDP body.');
             sdp = describeResponse.body.toString();
@@ -257,25 +312,25 @@ export abstract class RtspSmartCamera extends RtspCamera implements Intercom { /
             }
 
             if (!selectedTrack || !selectedCodecInfo) {
-                throw new Error("Camera does not advertise a supported audio input stream (AAC, PCMU, PCMA with a=sendonly/a=sendrecv) via SDP.");
+                throw new Error("Camera does not advertise a supported audio input stream (AAC, PCMU, PCMA with a=sendonly/a=sendrecv) in its SDP.");
             }
-            this.console.log(`Selected audio input track: ${selectedTrack.control}, Codec: ${selectedCodecInfo.name}, PT: ${selectedCodecInfo.payloadType}`);
+            this.console.log(`Selected audio input track: ${selectedTrack.control || 'N/A (base URL assumed)'}, Codec: ${selectedCodecInfo.name}, PT: ${selectedCodecInfo.payloadType}`);
 
-            setupUrl = selectedTrack.control; // RtspClient will resolve if relative to DESCRIBE URL
-            if (!setupUrl) throw new Error("Selected audio track in SDP is missing 'a=control' attribute.");
+            setupControlUrl = selectedTrack.control || ''; // if control is not present, use base URL (empty string for RtspClient relative path)
+                                                       // RtspClient resolves '' or relative paths against its base URL.
 
             // Attempt SETUP with UDP first
             try {
-                this.console.log(`Attempting UDP SETUP for track ${setupUrl}`);
+                this.console.log(`Attempting UDP SETUP for track control: '${setupControlUrl}'`);
                 this.intercomUdpServer = await createBindZero('udp4');
                 const clientRtpPortUdp = this.intercomUdpServer.port;
                 const clientRtcpPortUdp = clientRtpPortUdp + 1;
                 const udpTransportHeader = `RTP/AVP;unicast;client_port=${clientRtpPortUdp}-${clientRtcpPortUdp}`;
 
-                const setupResponseUdp = await this.intercomClient.request('SETUP', { Transport: udpTransportHeader }, setupUrl);
-                this.console.debug("Received UDP SETUP response:", setupResponseUdp.headers);
+                const setupResponseUdp = await this.intercomClient.request('SETUP', { Transport: udpTransportHeader }, setupControlUrl);
+                this.console.debug("Received UDP SETUP response headers:", setupResponseUdp.headers);
                 confirmedTransportDict = parseSemicolonDelimited(setupResponseUdp.headers.transport);
-                if (!confirmedTransportDict) throw new Error('UDP SETUP response missing Transport header.');
+                if (!confirmedTransportDict) throw new Error('UDP SETUP response missing or invalid Transport header.');
 
                 currentSessionId = setupResponseUdp.headers.session?.split(';')[0];
                 if (!currentSessionId) throw new Error('UDP SETUP response missing Session ID.');
@@ -285,40 +340,44 @@ export abstract class RtspSmartCamera extends RtspCamera implements Intercom { /
                 serverRtpPortUdp = parseInt(serverPortStringUdp.split('-')[0]);
 
                 chosenTransport = 'udp';
-                this.console.log(`UDP SETUP successful. Session: ${currentSessionId}, Server RTP: ${serverRtpPortUdp}`);
+                this.console.log(`UDP SETUP successful. Session: ${currentSessionId}, Server RTP Port: ${serverRtpPortUdp}`);
             } catch (udpError) {
-                this.console.warn(`UDP SETUP failed for track ${setupUrl}: ${udpError.message}. Attempting TCP SETUP.`);
-                if (this.intercomUdpServer) { // Clean up UDP server if it was created
+                this.console.warn(`UDP SETUP failed for track control '${setupControlUrl}': ${udpError.message}. Attempting TCP SETUP.`);
+                if (this.intercomUdpServer) {
                     this.intercomUdpServer.server.close();
                     this.intercomUdpServer = undefined;
                 }
-                // Reset session on client if partial from UDP attempt
-                if (this.intercomClient.session) this.intercomClient.session = undefined;
+                if (this.intercomClient.session) this.intercomClient.session = undefined; // Reset session before TCP attempt
 
-
-                this.console.log(`Attempting TCP SETUP for track ${setupUrl}`);
-                const tcpTransportHeader = `RTP/AVP/TCP;unicast;interleaved=0-1`;
-                const setupResponseTcp = await this.intercomClient.request('SETUP', { Transport: tcpTransportHeader }, setupUrl);
-                this.console.debug("Received TCP SETUP response:", setupResponseTcp.headers);
+                this.console.log(`Attempting TCP SETUP for track control: '${setupControlUrl}'`);
+                const tcpTransportHeader = `RTP/AVP/TCP;unicast;interleaved=0-1`; // Propose channels 0-1
+                const setupResponseTcp = await this.intercomClient.request('SETUP', { Transport: tcpTransportHeader }, setupControlUrl);
+                this.console.debug("Received TCP SETUP response headers:", setupResponseTcp.headers);
                 confirmedTransportDict = parseSemicolonDelimited(setupResponseTcp.headers.transport);
-                if (!confirmedTransportDict) throw new Error('TCP SETUP response missing Transport header.');
+                if (!confirmedTransportDict) throw new Error('TCP SETUP response missing or invalid Transport header.');
 
                 currentSessionId = setupResponseTcp.headers.session?.split(';')[0];
                 if (!currentSessionId) throw new Error('TCP SETUP response missing Session ID.');
 
-                chosenTransport = 'tcp';
-                this.console.log(`TCP SETUP successful. Session: ${currentSessionId}, Interleaved: ${confirmedTransportDict.interleaved || '0-1'}`);
-            }
-            this.intercomClient.session = currentSessionId; // Set session on the client instance for subsequent PLAY/TEARDOWN
+                // Verify TCP setup was accepted with interleaved
+                if (!confirmedTransportDict.interleaved) {
+                    this.console.warn('TCP SETUP response did not confirm interleaved mode in Transport header. Proceeding with 0-1.');
+                    // Ensure confirmedTransportDict has a default for onRtp logic later
+                    confirmedTransportDict.interleaved = confirmedTransportDict.interleaved || '0-1';
+                }
 
-            // SSRC
+                chosenTransport = 'tcp';
+                this.console.log(`TCP SETUP successful. Session: ${currentSessionId}, Interleaved: ${confirmedTransportDict.interleaved}`);
+            }
+            this.intercomClient.session = currentSessionId;
+
             if (confirmedTransportDict.ssrc) {
                 const ssrcBuffer = Buffer.from(confirmedTransportDict.ssrc, 'hex');
                 ssrcUnsigned = ssrcBuffer.readUint32BE(0);
             } else {
                 ssrcUnsigned = crypto.randomBytes(4).readUint32BE(0);
             }
-            this.console.log(`Using SSRC (unsigned): ${ssrcUnsigned} for transport ${chosenTransport}`);
+            this.console.log(`Using SSRC (unsigned): ${ssrcUnsigned} for ${chosenTransport} transport.`);
 
             let ffmpegEncoderArguments: string[];
             switch (selectedCodecInfo.ffmpegEncodingName) {
@@ -338,7 +397,7 @@ export abstract class RtspSmartCamera extends RtspCamera implements Intercom { /
             this.intercomForwarder = await startRtpForwarderProcess(this.console, ffmpegInput, {
                 audio: {
                     encoderArguments: ffmpegEncoderArguments, payloadType: selectedCodecInfo.payloadType,
-                    ssrc: crypto.randomBytes(4).readInt32BE(0), // FFmpeg internal SSRC, we override packets.
+                    ssrc: crypto.randomBytes(4).readInt32BE(0),
                     onRtp: (rtp) => {
                         const packet = RtpPacket.deSerialize(rtp);
                         packet.header.payloadType = selectedCodecInfo.payloadType;
@@ -357,11 +416,13 @@ export abstract class RtspSmartCamera extends RtspCamera implements Intercom { /
             });
             this.console.log('RTP forwarder process started.');
 
-            this.intercomClient.client.on('close', () => { this.console.warn('RTSP client connection closed unexpectedly.'); this.stopIntercom(); });
-            this.intercomForwarder.killPromise.finally(() => { this.console.log('RTP forwarder stopped.'); });
+            this.intercomClient.client.on('close', () => { this.console.warn('RTSP client connection closed unexpectedly during active intercom.'); this.stopIntercom(); });
+            this.intercomForwarder.killPromise.finally(() => { this.console.log('RTP forwarder process stopped.'); /* May need to call stopIntercom if not already stopping */ });
 
-            this.console.log(`Sending RTSP PLAY for session ${currentSessionId} on track ${setupUrl}`);
-            await this.intercomClient.request('PLAY', { Session: currentSessionId }, setupUrl);
+            // Use setupControlUrl for PLAY, as it's the track-specific control URL
+            const playUrl = setupControlUrl;
+            this.console.log(`Sending RTSP PLAY for session ${currentSessionId} on track control URL: '${playUrl}'`);
+            await this.intercomClient.request('PLAY', { Session: currentSessionId }, playUrl);
             this.console.log('Intercom PLAY successful. Audio should be streaming.');
 
         } catch (e) {
@@ -374,66 +435,13 @@ export abstract class RtspSmartCamera extends RtspCamera implements Intercom { /
     }
 
     async stopIntercom(): Promise<void> {
-        this.console.log('Attempting to stop intercom session (minimal config)...');
-
-        if (this.intercomForwarder) {
-            this.console.log('Killing intercom RTP forwarder process.');
-            try {
-                this.intercomForwarder.kill();
-                // Not awaiting killPromise here to make stopIntercom return faster.
-                // killPromise is monitored in startIntercom if needed for other actions.
-            } catch (e) {
-                this.console.error("Error while killing intercom forwarder:", e.message);
-            }
-            this.intercomForwarder = undefined;
-        } else {
-            this.console.log('No active intercom RTP forwarder found.');
-        }
-
-        if (this.intercomClient) {
-            this.console.log(`Intercom RTSP client found. Session ID: ${this.intercomClient.session || 'N/A'}.`);
-            if (this.intercomClient.session && this.intercomClient.url) {
-                try {
-                    const teardownUrl = this.intercomClient.url.toString();
-                    this.console.log(`Sending RTSP TEARDOWN for session ${this.intercomClient.session} to ${teardownUrl}`);
-                    await this.intercomClient.request('TEARDOWN', { Session: this.intercomClient.session }, teardownUrl);
-                    this.console.log(`RTSP TEARDOWN successful for session ${this.intercomClient.session}.`);
-                } catch (e) {
-                    let errorMessage = 'Error during intercom TEARDOWN';
-                    if (e.rtspStatusCode) {
-                        errorMessage += `: RTSP Error ${e.rtspStatusCode}`;
-                    }
-                    if (e.message) {
-                        errorMessage += `: ${e.message}`;
-                    }
-                    this.console.error(errorMessage, e.stack);
-                }
-            } else {
-                this.console.log('No active RTSP session or valid URL for intercom client. Skipping TEARDOWN command.');
-            }
-            try {
-                this.intercomClient.safeTeardown();
-                this.console.log('Intercom RTSP client torn down.');
-            } catch (e) {
-                this.console.error("Error during RTSP client safeTeardown:", e.message);
-            }
-            this.intercomClient = undefined;
-        } else {
-            this.console.log('No active intercom RTSP client found.');
-        }
-
-        if (this.intercomUdpServer) {
-            this.console.log('Closing intercom UDP server.');
-            try {
-                this.intercomUdpServer.server.close();
-            } catch (e) {
-                this.console.error("Error while closing intercom UDP server:", e.message);
-            }
-            this.intercomUdpServer = undefined;
-        } else {
-            this.console.log('No active intercom UDP server found.');
-        }
-        this.console.log('Intercom stop sequence complete.');
+        this.console.warn("RTSP stopIntercom called. Basic cleanup will be performed.");
+        if (this.intercomForwarder && typeof this.intercomForwarder.kill === 'function') this.intercomForwarder.kill();
+        if (this.intercomClient && typeof this.intercomClient.safeTeardown === 'function') this.intercomClient.safeTeardown();
+        if (this.intercomUdpServer && typeof this.intercomUdpServer.server?.close === 'function') this.intercomUdpServer.server.close();
+        this.intercomForwarder = undefined;
+        this.intercomClient = undefined;
+        this.intercomUdpServer = undefined;
     }
 
     updateDeviceInterfaces() {
@@ -523,9 +531,11 @@ export abstract class RtspSmartCamera extends RtspCamera implements Intercom { /
 
     async putSetting(key: string, value: SettingValue) {
         await super.putSetting(key, value);
-        if (key === 'enableTwoWayAudio') {
-            this.updateDeviceInterfaces();
+        if (key === 'enableTwoWayAudio' || key === 'intercomSdpSourceStreamId') { // Also update if source stream changes? Not strictly necessary for interfaces.
+            this.updateDeviceInterfaces(); // Mainly for enableTwoWayAudio
         }
+        // For other settings changes that might affect intercom if it's running,
+        // it might need to be restarted. For now, only interface update on enable/disable.
         this.listener?.then(l => l.emit('error', new Error("new settings have been applied")));
     }
 
@@ -675,7 +685,7 @@ export abstract class RtspSmartCamera extends RtspCamera implements Intercom { /
 }
 
 export abstract class RtspProvider extends CameraProviderBase<UrlMediaStreamOptions> {
-    getDefaultCameraType(): ScryptedDeviceType { // Ensure this exists
+    getDefaultCameraType(): ScryptedDeviceType {
         return ScryptedDeviceType.Camera;
     }
 
